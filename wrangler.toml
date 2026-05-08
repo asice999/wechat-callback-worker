@@ -1,0 +1,12 @@
+name = "wechat-callback-worker"
+main = "src/worker.js"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# 生产环境变量请用 wrangler secret 设置，不要写在这里：
+# wrangler secret put WECHAT_TOKEN
+# wrangler secret put WECHAT_ENCODING_AES_KEY
+# wrangler secret put WECHAT_CORP_ID
+
+[observability]
+enabled = true
