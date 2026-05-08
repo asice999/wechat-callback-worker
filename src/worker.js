@@ -1,32 +1,35 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 
-// ===================== 北京时间函数 (UTC+8) ===================== //
-function getBeijingTimestamp() {
-  // 8*3600 = 28800秒 (UTC+8)
-  return String(Math.floor(Date.now() / 1000) + 28800);
+function cleanEnvValue(value) {
+  if (value === undefined || value === null) return '';
+  let v = String(value).trim();
+  if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+    v = v.slice(1, -1).trim();
+  }
+  return v;
 }
-// ============================================================= //
 
 function requireEnv(env, name) {
-  const value = env[name];
+  const value = cleanEnvValue(env[name]);
   if (!value) throw new Error(`Missing environment variable: ${name}`);
   return value;
 }
 
 function getConfig(env) {
   const token = requireEnv(env, 'WECHAT_TOKEN');
-  const encodingAesKey = requireEnv(env, 'WECHAT_ENCODING_AES_KEY');
+  let encodingAesKey = requireEnv(env, 'WECHAT_ENCODING_AES_KEY');
   const corpId = requireEnv(env, 'WECHAT_CORP_ID');
 
-  console.log("配置加载成功（部分隐藏）:", {
-    token: token.substring(0, 2) + "​***​" + token.substring(token.length - 2),
-    encodingAesKey: encodingAesKey.substring(0, 2) + "​***​" + encodingAesKey.substring(encodingAesKey.length - 2),
-    corpId: corpId.substring(0, 2) + "​***​" + corpId.substring(corpId.length - 2)
-  });
+  // 企业微信 EncodingAESKey 标准长度是 43 位，不需要带末尾的 =
+  encodingAesKey = encodingAesKey.replace(/=+$/g, '').trim();
+
+  if (encodingAesKey.length !== 43) {
+    throw new Error(`WECHAT_ENCODING_AES_KEY length invalid: expected 43, got ${encodingAesKey.length}`);
+  }
 
   const aesKey = Buffer.from(`${encodingAesKey}=`, 'base64');
   if (aesKey.length !== 32) {
-    throw new Error('WECHAT_ENCODING_AES_KEY is invalid: decoded key must be 32 bytes');
+    throw new Error(`WECHAT_ENCODING_AES_KEY decode invalid: expected 32 bytes, got ${aesKey.length}`);
   }
 
   return { token, encodingAesKey, corpId, aesKey };
@@ -36,23 +39,13 @@ function sha1(text) {
   return createHash('sha1').update(text, 'utf8').digest('hex');
 }
 
+function calcSignature(token, timestamp, nonce, encrypt) {
+  return sha1([token, timestamp, nonce, encrypt].sort().join(''));
+}
+
 function checkSignature(token, signature, timestamp, nonce, encrypt) {
   if (!signature || !timestamp || !nonce || !encrypt) return false;
-  
-  const raw = [token, timestamp, nonce, encrypt].sort().join('');
-  const computedSignature = sha1(raw);
-  
-  console.log("签名验证参数:", {
-    token: token.substring(0, 2) + "​***​",
-    timestamp,
-    nonce,
-    encrypt: encrypt.substring(0, 10) + "..." + encrypt.substring(encrypt.length - 5)
-  });
-  
-  console.log("计算签名:", computedSignature);
-  console.log("接收签名:", signature);
-  
-  return computedSignature === signature;
+  return calcSignature(token, timestamp, nonce, encrypt) === signature;
 }
 
 function pkcs7Pad(buffer, blockSize = 32) {
@@ -63,7 +56,7 @@ function pkcs7Pad(buffer, blockSize = 32) {
 function pkcs7Unpad(buffer) {
   if (!buffer.length) throw new Error('Invalid PKCS7 padding: empty buffer');
   const pad = buffer[buffer.length - 1];
-  if (pad < 1 || pad > 32) throw new Error('Invalid PKCS7 padding');
+  if (pad < 1 || pad > 32) throw new Error(`Invalid PKCS7 padding: ${pad}`);
   return buffer.subarray(0, buffer.length - pad);
 }
 
@@ -77,13 +70,15 @@ function decryptMsg(encryptText, config) {
   ]);
 
   const unpadded = pkcs7Unpad(decrypted);
+  if (unpadded.length < 20) throw new Error('Decrypted payload too short');
+
   const content = unpadded.subarray(16);
   const xmlLen = content.readUInt32BE(0);
   const xmlContent = content.subarray(4, 4 + xmlLen).toString('utf8');
-  const corpId = content.subarray(4 + xmlLen).toString('utf8');
+  const receiveId = content.subarray(4 + xmlLen).toString('utf8');
 
-  if (corpId !== config.corpId) {
-    throw new Error('CorpID mismatch');
+  if (receiveId !== config.corpId) {
+    throw new Error(`ReceiveId mismatch: expected ${config.corpId}, got ${receiveId}`);
   }
 
   return xmlContent;
@@ -103,11 +98,11 @@ function encryptMsg(replyXml, nonce, timestamp, config) {
   cipher.setAutoPadding(false);
   const encrypted = Buffer.concat([cipher.update(paddedMsg), cipher.final()]).toString('base64');
 
-  const signature = sha1([config.token, timestamp, nonce, encrypted].sort().join(''));
+  const msgSignature = calcSignature(config.token, timestamp, nonce, encrypted);
 
   return `<xml>
   <Encrypt><![CDATA[${encrypted}]]></Encrypt>
-  <MsgSignature><![CDATA[${signature}]]></MsgSignature>
+  <MsgSignature><![CDATA[${msgSignature}]]></MsgSignature>
   <TimeStamp>${timestamp}</TimeStamp>
   <Nonce><![CDATA[${nonce}]]></Nonce>
 </xml>`;
@@ -124,133 +119,169 @@ function cdata(value) {
   return String(value ?? '').replace(/\]\]>/g, ']]]]><![CDATA[>');
 }
 
-async function handleCallback(request, env) {
-  try {
-    const config = getConfig(env);
-    const url = new URL(request.url);
-    const signature = url.searchParams.get('msg_signature');
-    
-    // ============== 使用北京时间 (UTC+8) ============== //
-    const timestamp = url.searchParams.get('timestamp') || getBeijingTimestamp();
-    // ================================================ //
-    
-    const nonce = url.searchParams.get('nonce') || randomBytes(8).toString('hex');
+function nowTimestamp() {
+  // Unix 时间戳不分时区，不能手动 +8 小时
+  return String(Math.floor(Date.now() / 1000));
+}
 
-    console.log("请求方法:", request.method);
-    console.log("请求路径:", url.pathname);
-    console.log("北京时间戳:", timestamp, 
-               "ISO格式:", new Date(parseInt(timestamp) * 1000).toISOString());
-    console.log("请求参数:", {
-      signature: signature ? signature.substring(0, 5) + "..." : "null",
-      nonce: nonce.substring(0, 3) + "..."
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: { 'content-type': 'application/json; charset=utf-8' },
+  });
+}
+
+async function handleCallback(request, env) {
+  const config = getConfig(env);
+  const url = new URL(request.url);
+  const signature = url.searchParams.get('msg_signature');
+  const timestamp = url.searchParams.get('timestamp');
+  const nonce = url.searchParams.get('nonce');
+
+  console.log('callback request', {
+    method: request.method,
+    path: url.pathname,
+    has_signature: Boolean(signature),
+    has_timestamp: Boolean(timestamp),
+    has_nonce: Boolean(nonce),
+    colo: request.cf?.colo,
+  });
+
+  if (request.method === 'GET') {
+    const echostr = url.searchParams.get('echostr');
+
+    if (!signature || !timestamp || !nonce || !echostr) {
+      return new Response('Missing required query parameters', { status: 400 });
+    }
+
+    const computed = calcSignature(config.token, timestamp, nonce, echostr);
+    console.log('GET signature check', {
+      matched: computed === signature,
+      received_prefix: signature.slice(0, 8),
+      computed_prefix: computed.slice(0, 8),
+      echostr_len: echostr.length,
     });
 
-    // 时间戳检查
-    const serverTime = parseInt(timestamp);
-    const clientTime = url.searchParams.get('timestamp') ? 
-                      parseInt(url.searchParams.get('timestamp')) : serverTime;
-    const timeDiff = Math.abs(serverTime - clientTime);
-    console.log(`时间差: ${timeDiff}秒`);
-    if (timeDiff > 7200) {
-      console.warn("⚠️ 时间差超过2小时，可能验证失败");
+    if (computed !== signature) {
+      return new Response('signature error', { status: 403 });
     }
 
-    if (request.method === 'GET') {
-      const echostr = url.searchParams.get('echostr');
-      console.log("GET 验证 echostr:", echostr ? echostr.substring(0, 10) + "..." : "undefined");
-      
-      if (!signature || !timestamp || !nonce || !echostr) {
-        return new Response('Missing required query parameters', { status: 400 });
-      }
-      
-      if (!checkSignature(config.token, signature, timestamp, nonce, echostr)) {
-        return new Response('signature error', { status: 403 });
-      }
+    try {
+      const plainText = decryptMsg(echostr, config);
+      console.log('GET decrypt ok', { plaintext_len: plainText.length });
+      return new Response(plainText, {
+        headers: { 'content-type': 'text/plain; charset=utf-8' },
+      });
+    } catch (err) {
+      console.error('GET decrypt error', err.message);
+      return new Response(`decrypt error: ${err.message}`, { status: 500 });
+    }
+  }
 
-      try {
-        const decrypted = decryptMsg(echostr, config);
-        console.log("✅ 解密成功:", decrypted);
-        return new Response(decrypted, {
-          headers: { 'content-type': 'text/plain; charset=utf-8' },
-        });
-      } catch (err) {
-        console.error("❌ 解密失败:", err.message);
-        return new Response(`decrypt error: ${err.message}`, { status: 500 });
-      }
+  if (request.method === 'POST') {
+    const xmlData = await request.text();
+    const encrypt = extractXmlTag(xmlData, 'Encrypt');
+
+    if (!signature || !timestamp || !nonce || !encrypt) {
+      return new Response('Missing required POST parameters', { status: 400 });
     }
 
-    if (request.method === 'POST') {
-      const xmlData = await request.text();
-      const encrypt = extractXmlTag(xmlData, 'Encrypt');
+    const computed = calcSignature(config.token, timestamp, nonce, encrypt);
+    console.log('POST signature check', {
+      matched: computed === signature,
+      received_prefix: signature.slice(0, 8),
+      computed_prefix: computed.slice(0, 8),
+      encrypt_len: encrypt.length,
+    });
 
-      if (!signature || !timestamp || !nonce || !encrypt) {
-        return new Response('Missing required POST parameters', { status: 400 });
-      }
-      if (!checkSignature(config.token, signature, timestamp, nonce, encrypt)) {
-        return new Response('signature error', { status: 403 });
-      }
+    if (computed !== signature) {
+      return new Response('signature error', { status: 403 });
+    }
 
-      try {
-        const decryptedXml = decryptMsg(encrypt, config);
-        const msgType = extractXmlTag(decryptedXml, 'MsgType');
-        const fromUserName = extractXmlTag(decryptedXml, 'FromUserName');
-        const toUserName = extractXmlTag(decryptedXml, 'ToUserName');
-        const content = msgType === 'text' ? extractXmlTag(decryptedXml, 'Content') : '非文本消息';
+    try {
+      const decryptedXml = decryptMsg(encrypt, config);
+      const msgType = extractXmlTag(decryptedXml, 'MsgType');
+      const fromUserName = extractXmlTag(decryptedXml, 'FromUserName');
+      const toUserName = extractXmlTag(decryptedXml, 'ToUserName');
+      const content = msgType === 'text' ? extractXmlTag(decryptedXml, 'Content') : '非文本消息';
 
-        console.log(`📩 解密后消息类型: ${msgType}, 内容: ${content.substring(0, 20)}${content.length > 20 ? '...' : ''}`);
+      console.log('POST decrypt ok', { msgType, content_len: content.length });
 
-        const replyXml = `<xml>
+      const replyXml = `<xml>
   <ToUserName><![CDATA[${cdata(fromUserName)}]]></ToUserName>
   <FromUserName><![CDATA[${cdata(toUserName)}]]></FromUserName>
-  <CreateTime>${getBeijingTimestamp()}</CreateTime>
+  <CreateTime>${nowTimestamp()}</CreateTime>
   <MsgType><![CDATA[text]]></MsgType>
   <Content><![CDATA[收到你的消息: ${cdata(content)}]]></Content>
 </xml>`;
 
-        console.log("📤 回复内容:", `收到你的消息: ${content.substring(0, 10)}...`);
-        return new Response(encryptMsg(replyXml, nonce, timestamp, config), {
-          headers: { 'content-type': 'application/xml; charset=utf-8' },
-        });
-      } catch (err) {
-        console.error("❌ 消息处理失败:", err.message);
-        return new Response(`decrypt error: ${err.message}`, { status: 500 });
-      }
+      return new Response(encryptMsg(replyXml, nonce, timestamp, config), {
+        headers: { 'content-type': 'application/xml; charset=utf-8' },
+      });
+    } catch (err) {
+      console.error('POST decrypt/process error', err.message);
+      return new Response(`decrypt error: ${err.message}`, { status: 500 });
     }
-
-    return new Response('Method Not Allowed', { status: 405 });
-  } catch (err) {
-    console.error("🔥 全局错误:", err.stack);
-    return new Response(`Server error: ${err.message}`, { status: 500 });
   }
+
+  return new Response('Method Not Allowed', { status: 405 });
 }
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    if (url.pathname === '/' || url.pathname === '/health') {
-      return new Response('wechat-callback worker ok', {
-        headers: { 'content-type': 'text/plain; charset=utf-8' },
-      });
-    }
-    
-    // 添加时间检查端点
-    if (url.pathname === '/time-check') {
-      return new Response(JSON.stringify({
-        beijing_timestamp: getBeijingTimestamp(),
-        utc_timestamp: Math.floor(Date.now() / 1000),
-        iso_beijing: new Date(parseInt(getBeijingTimestamp()) * 1000).toISOString(),
-        iso_utc: new Date().toISOString(),
-        message: "Worker is using UTC+8 (Beijing Time)"
-      }, null, 2), {
-        headers: { 'content-type': 'application/json; charset=utf-8' }
-      });
-    }
+    try {
+      if (url.pathname === '/' || url.pathname === '/health') {
+        return new Response('wechat-callback worker ok', {
+          headers: { 'content-type': 'text/plain; charset=utf-8' },
+        });
+      }
 
-    if (url.pathname === '/callback') {
-      return handleCallback(request, env);
-    }
+      if (url.pathname === '/debug-env') {
+        let configOk = false;
+        let error = '';
+        let info = {};
+        try {
+          const token = cleanEnvValue(env.WECHAT_TOKEN);
+          const encodingAesKeyRaw = cleanEnvValue(env.WECHAT_ENCODING_AES_KEY);
+          const encodingAesKey = encodingAesKeyRaw.replace(/=+$/g, '').trim();
+          const corpId = cleanEnvValue(env.WECHAT_CORP_ID);
+          const aesKey = encodingAesKey ? Buffer.from(`${encodingAesKey}=`, 'base64') : Buffer.alloc(0);
+          getConfig(env);
+          configOk = true;
+          info = {
+            token_set: Boolean(token),
+            token_len: token.length,
+            encoding_aes_key_set: Boolean(encodingAesKeyRaw),
+            encoding_aes_key_len_after_trim: encodingAesKey.length,
+            aes_key_decoded_bytes: aesKey.length,
+            corp_id_set: Boolean(corpId),
+            corp_id_len: corpId.length,
+          };
+        } catch (e) {
+          error = e.message;
+        }
+        return jsonResponse({ ok: configOk, error, ...info });
+      }
 
-    return new Response('Not Found', { status: 404 });
+      if (url.pathname === '/time-check') {
+        return jsonResponse({
+          unix_timestamp: nowTimestamp(),
+          iso_utc: new Date().toISOString(),
+          note: 'Unix timestamp is timezone-independent. Do not add 8 hours.',
+          colo: request.cf?.colo || null,
+        });
+      }
+
+      if (url.pathname === '/callback') {
+        return handleCallback(request, env);
+      }
+
+      return new Response('Not Found', { status: 404 });
+    } catch (err) {
+      console.error('global error', err.message);
+      return new Response(`Server error: ${err.message}`, { status: 500 });
+    }
   },
 };
